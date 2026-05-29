@@ -220,13 +220,12 @@ def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> No
     }
 
     // ====================================================
-    // [3] 动态分发：Lite Manager 调度引擎源码 
+    // [3] 动态分发：Lite Manager 调度引擎源码 (带有强制换IP功能)
     // ====================================================
     if (url.pathname === "/scripts/lite_manager.py") {
       const MANAGER_CODE = `#!/usr/bin/env python3
 import base64, csv, os, subprocess, threading, time, urllib.request, json
 from pathlib import Path
-
 
 PROXY_PORT = 7920
 API_URL = "https://www.vpngate.net/api/iphone/"
@@ -239,13 +238,13 @@ AUTH_FILE = WORKSPACE / "auth.txt"
 WEB_USER = "${WEB_USER}"
 WEB_PASS = "${WEB_PASS}"
 
-
 target_country = "JP"
 current_process = None
 current_ip = ""
 current_country = ""
 connected_at = 0
 is_connecting = False
+last_switch_trigger = 0  # 追踪换IP指令
 
 state_lock = threading.Lock()
 dead_ips = set()
@@ -271,22 +270,32 @@ def get_c2_headers():
     }
 
 def update_config_loop():
-    global target_country, current_process, current_country
+    global target_country, current_process, current_country, last_switch_trigger, current_ip, dead_ips
     while True:
         try:
             req = urllib.request.Request(f"{C2_URL}/api/config", headers=get_c2_headers())
             with urllib.request.urlopen(req, timeout=10) as res:
                 data = json.loads(res.read().decode("utf-8"))
                 desired_country = str(data.get("0", "JP")).upper()
+                switch_trigger = int(data.get("switch_trigger", 0))
                 
                 with state_lock:
-                    if target_country != desired_country:
+                    force_switch = (switch_trigger > last_switch_trigger)
+                    
+                    if target_country != desired_country or force_switch:
                         target_country = desired_country
+                        
                         if current_process and current_process.poll() is None:
-                            if current_country and current_country != desired_country:
-                                print(f"[*] 策略热切换: 目标重定向到 {desired_country}，正在掐断旧连接...", flush=True)
+                            if force_switch or (current_country and current_country != desired_country):
+                                if force_switch:
+                                    print(f"[*] 收到强制更换 IP 指令，正在将当前节点 {current_ip} 关入小黑屋并准备重拨...", flush=True)
+                                    if current_ip: dead_ips.add(current_ip)
+                                else:
+                                    print(f"[*] 策略热切换: 目标重定向到 {desired_country}，正在掐断旧连接...", flush=True)
                                 try: current_process.terminate(); current_process.wait(timeout=2)
                                 except: current_process.kill()
+                        
+                        last_switch_trigger = switch_trigger
         except Exception as e:
             pass
         time.sleep(15)
@@ -514,7 +523,7 @@ if __name__ == "__main__":
     }
 
     // ====================================================
-    // [4] 动态分发：VPS 一键安装脚本 (已修复中文日志乱码)
+    // [4] 动态分发：VPS 一键安装脚本
     // ====================================================
     if (url.pathname === "/agent") {
       const agentScript = `#!/usr/bin/env bash
@@ -596,13 +605,15 @@ echo "[+] 引擎更新成功！全息日志和5秒超高频机制已加载。"
         const { results } = await env.DB.prepare(`SELECT value FROM global_config WHERE key = 'slot_map'`).all();
         if (results && results.length > 0) return new Response(results[0].value, { headers: { "Content-Type": "application/json" } });
         
-        // 默认节点配置 (只返回 {"0": "JP"})
         return new Response(JSON.stringify({ "0": "JP" }), { headers: { "Content-Type": "application/json" } });
     }
 
+    // 修改：允许写入 switch_trigger 时间戳指令
     if (url.pathname === "/api/config" && request.method === "POST") {
         const data = await request.json();
         const sanitizedMap = { "0": data["0"] || "JP" };
+        if (data.switch_trigger) sanitizedMap.switch_trigger = data.switch_trigger;
+        
         await env.DB.prepare(`
             INSERT INTO global_config (key, value) VALUES ('slot_map', ?1)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -699,6 +710,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                     <span class="text-gray-400 text-sm">当前监听目标国家:</span>
                     <input type="text" id="slot-cfg-0" value="JP" class="bg-transparent border border-gray-600 rounded p-2 text-white font-bold text-lg uppercase focus:outline-none focus:border-blue-400 transition w-24 text-center" />
                     <button onclick="saveConfig()" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded text-sm font-bold shadow transition ml-4">强制下发配置</button>
+                    <button onclick="switchIP()" class="bg-purple-600 hover:bg-purple-500 text-white px-6 py-2 rounded text-sm font-bold shadow transition">更换新IP</button>
                 </div>
             </div>
         </div>
@@ -747,6 +759,16 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 body: JSON.stringify({ "0": val })
             });
             alert('指令下发成功！代理引擎将自动平滑切换。');
+        }
+
+        // 新增更换IP前端逻辑
+        async function switchIP() {
+            const val = document.getElementById(\`slot-cfg-0\`).value.toUpperCase().trim() || 'JP';
+            await fetch('/api/config', {
+                method: 'POST',
+                body: JSON.stringify({ "0": val, "switch_trigger": Date.now() })
+            });
+            alert('更换 IP 指令已发送！VPS 将在 15 秒的心跳周期内拉黑当前 IP 并顶替新节点。');
         }
 
         async function fetchNodes() {
