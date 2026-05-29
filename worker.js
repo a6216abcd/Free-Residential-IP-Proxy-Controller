@@ -220,7 +220,7 @@ def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> No
     }
 
     // ====================================================
-    // [3] 动态分发：Lite Manager 调度引擎源码 (增加AI测试功能)
+    // [3] 动态分发：Lite Manager 调度引擎源码 (降级:仅测 YouTube)
     // ====================================================
     if (url.pathname === "/scripts/lite_manager.py") {
       const MANAGER_CODE = `#!/usr/bin/env python3
@@ -412,14 +412,12 @@ def connect_node(node: dict):
                 return
 
             setup_routing()
-            time.sleep(1) # 给予系统路由表刷新时间
+            time.sleep(1) 
             
-            # ===== 新增：AI与流媒体服务连通性检测 =====
-            print(f"[*] 节点 ({node['country']}) 正在进行流媒体与AI解锁测试 (YouTube/ChatGPT/Claude)...", flush=True)
+            # ===== 修改：仅检测 YouTube 流媒体连通性 =====
+            print(f"[*] 节点 ({node['country']}) 正在进行流媒体解锁测试 (仅测 YouTube)...", flush=True)
             services = {
-                "YouTube": "https://www.youtube.com",
-                "ChatGPT": "https://chatgpt.com",
-                "Claude": "https://claude.ai"
+                "YouTube": "https://www.youtube.com"
             }
             check_passed = True
             for name, url in services.items():
@@ -442,7 +440,7 @@ def connect_node(node: dict):
                 current_ip = node["ip"]
                 current_country = node["country"]
                 connected_at = time.time()
-            print(f"[+] 代理节点 ({node['country']}) 完全就绪 (住宅与AI双重检测通过): {node['ip']}", flush=True)
+            print(f"[+] 代理节点 ({node['country']}) 完全就绪 (住宅与 YouTube 双重检测通过): {node['ip']}", flush=True)
             
         else:
             try: process.terminate(); process.wait(timeout=2)
@@ -813,7 +811,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                         \`<div class="inline-flex items-center bg-gray-700 border border-gray-600 rounded px-3 py-2 mr-2 mb-2 text-sm">
                             <span class="text-blue-400 font-bold mr-3">\${d.country}</span>
                             <span class="font-mono text-blue-200 mr-3" title="节点物理IP">\${d.node_ip || '分配中...'}:\${d.port}</span>
-                            <span class="text-green-400" title="已通过住宅 IP 与 AI 连通性双重检测">● 纯净解锁</span>
+                            <span class="text-green-400" title="已通过住宅 IP 与 YouTube 连通性双重检测">● 纯净解锁 (YT)</span>
                         </div>\`
                     ).join('');
 
