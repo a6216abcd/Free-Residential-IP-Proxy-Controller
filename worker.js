@@ -325,20 +325,22 @@ def update_config_loop():
         time.sleep(15)
 
 def c2_heartbeat_loop():
-    global public_ip, PROXY_PORT, tun_main
+    global public_ip, PROXY_PORT, tun_main, tun_backup
     while True:
         if not public_ip or public_ip == "Unknown_IP": get_public_ip()
         details = []
         with state_lock:
-            if tun_main.ready and tun_main.process and tun_main.process.poll() is None:
-                uptime = time.time() - tun_main.connected_at
-                details.append({
-                    "slot": 0, 
-                    "country": tun_main.country, 
-                    "port": PROXY_PORT, 
-                    "connected_time": int(uptime), 
-                    "node_ip": tun_main.ip
-                })
+            for tun in [tun_main, tun_backup]:
+                if tun.ready and tun.process and tun.process.poll() is None:
+                    uptime = time.time() - tun.connected_at
+                    details.append({
+                        "tunnel": tun.name,
+                        "active": proxy_server.ACTIVE_BIND == tun.name,
+                        "country": tun.country, 
+                        "port": PROXY_PORT, 
+                        "connected_time": int(uptime), 
+                        "node_ip": tun.ip
+                    })
         
         payload = json.dumps({"ip": public_ip, "details": details, "logs": get_recent_logs()}).encode('utf-8')
         try:
@@ -736,8 +738,11 @@ echo "[+] 引擎更新成功！主备双活通道、异步刷IP逻辑已全量�
       let proxyList = [];
       if (results) {
         for (let server of results) {
-          for (let node of JSON.parse(server.details)) {
-            proxyList.push(`socks5://${PROXY_USER}:${PROXY_PASS}@${server.ip}:${node.port}#${node.country}_Node_${node.node_ip || 'IP'}`);
+          const details = JSON.parse(server.details || '[]');
+          // API 提取节点时，只提取当前 Active 的流量节点
+          const activeNode = details.find(d => d.active) || details[0];
+          if (activeNode) {
+            proxyList.push(`socks5://${PROXY_USER}:${PROXY_PASS}@${server.ip}:${activeNode.port}#${activeNode.country}_ActiveNode_${activeNode.node_ip || 'IP'}`);
           }
         }
       }
@@ -892,7 +897,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                     <thead>
                         <tr class="bg-slate-900/80 text-slate-400 text-xs uppercase tracking-wider">
                             <th class="py-4 px-6 font-medium w-1/5">母机宿主 IP</th>
-                            <th class="py-4 px-6 font-medium">当前主出口通道状态 (Active)</th>
+                            <th class="py-4 px-6 font-medium">主备双路出口状态 (Active / Standby)</th>
                             <th class="py-4 px-6 font-medium w-32">心跳延迟</th>
                             <th class="py-4 px-6 font-medium text-right w-24">负载率</th>
                         </tr>
@@ -1077,22 +1082,33 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                     const details = JSON.parse(server.details || '[]');
                     const timeAgo = Math.floor((Date.now() - server.last_seen) / 1000);
                     
-                    let proxyBadges = details.map(d => 
-                        \`<div class="inline-flex items-center bg-slate-950 border border-slate-800/80 rounded-xl px-2.5 py-1.5 shadow-inner">
-                            <span class="bg-indigo-500/20 text-indigo-400 font-bold font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-indigo-500/20">\${d.country}</span>
-                            <span class="font-mono text-slate-300 text-sm tracking-wide mr-3" title="出口物理 IP">\${d.node_ip || '---.---.---.---'}:\${d.port}</span>
-                            <span class="flex items-center gap-1.5 text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/20 text-xs font-medium" title="已通过住宅 IP 与 YouTube 连通性双重检测">
-                                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span> 纯净双活
-                            </span>
-                        </div>\`
-                    ).join('');
-
-                    if (details.length === 0) proxyBadges = \`
+                    let proxyBadges = '';
+                    if (details.length === 0) {
+                        proxyBadges = \`
                         <div class="inline-flex items-center bg-slate-900 border border-amber-500/30 rounded-xl px-3 py-1.5 shadow-inner text-amber-400/90 text-sm">
                             <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-amber-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                            节点震荡熔断，异步抢救中...
-                        </div>
-                    \`;
+                            双路通道震荡熔断，正在全异步抢救拨号中...
+                        </div>\`;
+                    } else {
+                        proxyBadges = '<div class="flex flex-col gap-2">' + details.map(d => {
+                            const isActive = d.active;
+                            const statusColorClass = isActive ? 'bg-emerald-500' : 'bg-sky-500';
+                            const statusText = isActive ? 'ACTIVE (业务出口)' : 'STANDBY (热备就绪)';
+                            const borderColorClass = isActive ? 'border-emerald-500/30' : 'border-sky-500/30';
+                            const bgColorClass = isActive ? 'bg-emerald-500/10' : 'bg-sky-500/10';
+                            const textColorClass = isActive ? 'text-emerald-400' : 'text-sky-400';
+                            
+                            return \`
+                            <div class="inline-flex items-center bg-slate-950 border border-slate-800/80 rounded-xl px-2.5 py-1.5 shadow-inner">
+                                <span class="bg-slate-800 text-slate-300 font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-slate-700 font-bold">\${d.tunnel}</span>
+                                <span class="bg-indigo-500/20 text-indigo-400 font-bold font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-indigo-500/20">\${d.country}</span>
+                                <span class="font-mono text-slate-300 text-sm tracking-wide mr-3" title="出口物理 IP">\${d.node_ip || '---.---.---.---'}:\${d.port}</span>
+                                <span class="flex items-center gap-1.5 \${textColorClass} \${bgColorClass} px-2 py-0.5 rounded-md border \${borderColorClass} text-xs font-medium">
+                                    <span class="w-1.5 h-1.5 rounded-full \${statusColorClass} shadow-[0_0_5px_currentColor]"></span> \${statusText}
+                                </span>
+                            </div>\`;
+                        }).join('') + '</div>';
+                    }
 
                     return \`
                         <tr class="hover:bg-slate-800/30 transition-colors group">
@@ -1110,8 +1126,8 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                                 </span>
                             </td>
                             <td class="py-5 px-6 align-middle text-right">
-                                <span class="\${details.length === 1 ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'} py-1 px-3 rounded-md text-xs font-mono font-bold">
-                                    \${details.length} / 1
+                                <span class="\${details.length === 2 ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : (details.length === 1 ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30')} py-1 px-3 rounded-md text-xs font-mono font-bold">
+                                    \${details.length} / 2
                                 </span>
                             </td>
                         </tr>
@@ -1120,8 +1136,10 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
 
                 if (servers.length > 0 && servers[0].details) {
                     const details = JSON.parse(servers[0].details);
-                    if (details.length > 0 && details[0].node_ip) {
-                        const newIp = details[0].node_ip;
+                    // 深度质检报告：永远提取正在承载业务的 ACTIVE 网卡 IP 进行评分
+                    const activeNode = details.find(d => d.active) || details[0];
+                    if (activeNode && activeNode.node_ip) {
+                        const newIp = activeNode.node_ip;
                         if (newIp !== currentScoreIp) {
                             currentScoreIp = newIp;
                             document.getElementById('ip-score-section').style.display = 'block';
