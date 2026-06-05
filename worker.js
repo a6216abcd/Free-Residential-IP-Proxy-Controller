@@ -1,4 +1,4 @@
-// ======  Proxy Controller (Bandwidth Optimized) ======
+// ======  Proxy Controller (Active-Standby Multi-Tunnel) ======
 
 export default {
   async fetch(request, env, ctx) {
@@ -67,6 +67,9 @@ from typing import Any
 PROXY_USER = b"${PROXY_USER}"
 PROXY_PASS = b"${PROXY_PASS}"
 
+# 全局软开关：由 lite_manager 动态更新，实现秒切
+ACTIVE_BIND = "tun_main"
+
 def parse_int(value: Any) -> int:
     try: return int(value)
     except: return 0
@@ -79,7 +82,9 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
-def create_connection(address: tuple[str, int], bind_interface: str, timeout: float = 20) -> socket.socket:
+def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+    global ACTIVE_BIND
+    bind_interface = ACTIVE_BIND
     host, port = address
     err = None
     for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
@@ -108,7 +113,7 @@ def relay(left: socket.socket, right: socket.socket) -> None:
             if not data: return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes, bind_interface: str) -> None:
+def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
@@ -139,7 +144,7 @@ def socks5_client(client: socket.socket, first_byte: bytes, bind_interface: str)
         else: return
         port = int.from_bytes(recv_exact(client, 2), "big")
         
-        upstream = create_connection((host, port), bind_interface, timeout=20)
+        upstream = create_connection((host, port), timeout=20)
         client.sendall(b"\\x05\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00")
         relay(client, upstream)
     except: pass
@@ -147,7 +152,7 @@ def socks5_client(client: socket.socket, first_byte: bytes, bind_interface: str)
         client.close()
         if upstream: upstream.close()
 
-def http_client(client: socket.socket, first_byte: bytes, bind_interface: str) -> None:
+def http_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
     try:
         data = first_byte
@@ -173,7 +178,7 @@ def http_client(client: socket.socket, first_byte: bytes, bind_interface: str) -
         method, target, version = lines[0].split(" ", 2)
         if method.upper() == "CONNECT":
             host, _, port_text = target.partition(":")
-            upstream = create_connection((host, parse_int(port_text) or 443), bind_interface, timeout=20)
+            upstream = create_connection((host, parse_int(port_text) or 443), timeout=20)
             client.sendall(b"HTTP/1.1 200 Connection Established\\r\\n\\r\\n")
             if rest: upstream.sendall(rest)
             relay(client, upstream)
@@ -184,7 +189,7 @@ def http_client(client: socket.socket, first_byte: bytes, bind_interface: str) -
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:", "proxy-authorization:"))]
         request = f"{method} {path} {version}\\r\\n" + "\\r\\n".join(headers) + "\\r\\nConnection: close\\r\\n\\r\\n"
-        upstream = create_connection((parsed.hostname, port), bind_interface, timeout=20)
+        upstream = create_connection((parsed.hostname, port), timeout=20)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except: pass
@@ -192,17 +197,17 @@ def http_client(client: socket.socket, first_byte: bytes, bind_interface: str) -
         client.close()
         if upstream: upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int], bind_interface: str) -> None:
+def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
-        if first == b"\\x05": socks5_client(client, first, bind_interface)
-        else: http_client(client, first, bind_interface)
+        if first == b"\\x05": socks5_client(client, first)
+        else: http_client(client, first)
     except:
         try: client.close()
         except: pass
 
-def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> None:
+def start_proxy_server(host: str, port: int) -> None:
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -212,7 +217,7 @@ def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> No
     while True:
         try:
             client, address = server.accept()
-            threading.Thread(target=proxy_client, args=(client, address, bind_interface), daemon=True).start()
+            threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
         except: time.sleep(0.5)
 `;
       return new Response(PROXY_CODE, { headers: { "Content-Type": "text/plain;charset=UTF-8" } });
@@ -222,6 +227,7 @@ def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> No
       const MANAGER_CODE = `#!/usr/bin/env python3
 import base64, csv, os, subprocess, threading, time, urllib.request, json
 from pathlib import Path
+import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 C2_URL = "${domain}"
@@ -235,11 +241,6 @@ WEB_PASS = "${WEB_PASS}"
 
 PROXY_PORT = 7920
 target_country = "JP"
-current_process = None
-current_ip = ""
-current_country = ""
-connected_at = 0
-is_connecting = False
 last_switch_trigger = 0  
 
 state_lock = threading.Lock()
@@ -249,6 +250,21 @@ public_ip = ""
 
 global_node_reservoir = {} 
 reservoir_lock = threading.Lock()
+
+class Tunnel:
+    def __init__(self, name: str, table_id: int):
+        self.name = name
+        self.table_id = table_id
+        self.process = None
+        self.node = None
+        self.ip = ""
+        self.country = ""
+        self.ready = False
+        self.connected_at = 0
+        self.is_connecting = False
+
+tun_main = Tunnel("tun_main", 101)
+tun_backup = Tunnel("tun_backup", 102)
 
 def get_public_ip():
     global public_ip
@@ -261,7 +277,7 @@ def get_public_ip():
 def get_c2_headers():
     auth_ptr = base64.b64encode(f"{WEB_USER}:{WEB_PASS}".encode()).decode()
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Authorization": f"Basic {auth_ptr}"
     }
 
@@ -269,11 +285,10 @@ def get_recent_logs():
     try:
         res = subprocess.run(["journalctl", "-u", "proxy-lite.service", "-n", "30", "--no-pager", "--output=cat"], capture_output=True, text=True, errors="replace")
         return res.stdout
-    except:
-        return "Waiting for logs..."
+    except: return "Waiting for logs..."
 
 def update_config_loop():
-    global target_country, current_process, current_country, last_switch_trigger, current_ip, dead_ips, PROXY_PORT
+    global target_country, last_switch_trigger, PROXY_PORT, tun_main, tun_backup
     while True:
         try:
             req = urllib.request.Request(f"{C2_URL}/api/config", headers=get_c2_headers())
@@ -284,54 +299,52 @@ def update_config_loop():
                 new_port = int(data.get("port", 7920))
                 
                 if new_port != PROXY_PORT:
-                    print(f"[*] 收到端口变更指令 ({PROXY_PORT} -> {new_port})，正在重启守护进程应用新端口...", flush=True)
+                    print(f"[*] 收到端口变更指令 ({PROXY_PORT} -> {new_port})，重启守护进程...", flush=True)
                     os._exit(0)
                 
                 with state_lock:
                     force_switch = (switch_trigger > last_switch_trigger)
-                    
                     if target_country != desired_country or force_switch:
                         target_country = desired_country
+                        if force_switch: print(f"[*] 收到强制更换指令，正在清退通道并拉黑当前 IP...", flush=True)
+                        else: print(f"[*] 策略热切换: 目标重定向到 {desired_country}...", flush=True)
                         
-                        if current_process and current_process.poll() is None:
-                            if force_switch or (current_country and current_country != desired_country):
-                                if force_switch:
-                                    print(f"[*] 收到强制更换 IP 指令，正在将当前节点 {current_ip} 关入小黑屋并准备重拨...", flush=True)
-                                    if current_ip: dead_ips.add(current_ip)
-                                else:
-                                    print(f"[*] 策略热切换: 目标重定向到 {desired_country}，正在掐断旧连接...", flush=True)
-                                try: current_process.terminate(); current_process.wait(timeout=2)
-                                except: current_process.kill()
+                        if tun_main.ip: dead_ips.add(tun_main.ip)
+                        if tun_main.process:
+                            try: tun_main.process.terminate(); tun_main.process.wait(2)
+                            except: tun_main.process.kill()
+                        tun_main.ready = False; tun_main.process = None; tun_main.ip = ""
+                        
+                        if tun_backup.process:
+                            try: tun_backup.process.terminate(); tun_backup.process.wait(2)
+                            except: tun_backup.process.kill()
+                        tun_backup.ready = False; tun_backup.process = None; tun_backup.ip = ""
                         
                         last_switch_trigger = switch_trigger
-        except Exception as e:
-            pass
+        except Exception as e: pass
         time.sleep(15)
 
 def c2_heartbeat_loop():
-    global public_ip, current_process, current_country, current_ip, connected_at, PROXY_PORT
+    global public_ip, PROXY_PORT, tun_main
     while True:
         if not public_ip or public_ip == "Unknown_IP": get_public_ip()
         details = []
         with state_lock:
-            if current_process and current_process.poll() is None:
-                uptime = time.time() - connected_at
-                if uptime > 10: 
-                    details.append({
-                        "slot": 0, 
-                        "country": current_country or target_country, 
-                        "port": PROXY_PORT, 
-                        "connected_time": int(uptime), 
-                        "node_ip": current_ip
-                    })
+            if tun_main.ready and tun_main.process and tun_main.process.poll() is None:
+                uptime = time.time() - tun_main.connected_at
+                details.append({
+                    "slot": 0, 
+                    "country": tun_main.country, 
+                    "port": PROXY_PORT, 
+                    "connected_time": int(uptime), 
+                    "node_ip": tun_main.ip
+                })
         
-        log_data = get_recent_logs()
-        payload = json.dumps({"ip": public_ip, "details": details, "logs": log_data}).encode('utf-8')
+        payload = json.dumps({"ip": public_ip, "details": details, "logs": get_recent_logs()}).encode('utf-8')
         try:
             req = urllib.request.Request(f"{C2_URL}/api/report", data=payload, headers=get_c2_headers(), method='POST')
             urllib.request.urlopen(req, timeout=10)
         except Exception as e: pass
-        
         time.sleep(8)
 
 def setup_env():
@@ -339,6 +352,9 @@ def setup_env():
     if not AUTH_FILE.exists():
         AUTH_FILE.write_text("vpn\\nvpn\\n", encoding="utf-8")
         AUTH_FILE.chmod(0o600)
+    # 强制系统解除反向路径过滤，防止策略路由双拨时数据包被内核丢弃
+    subprocess.run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"], capture_output=True)
+    subprocess.run(["sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"], capture_output=True)
 
 def harvest_snapshot_nodes() -> list:
     try:
@@ -359,10 +375,8 @@ def harvest_snapshot_nodes() -> list:
                 "harvested_at": time.time()
             })
         return nodes
-    except Exception as e: 
-        return []
+    except Exception as e: return []
 
-# 【核心修复】：增加独立的数据拉取线程，解耦流量浪费
 def vpngate_fetch_loop():
     global global_node_reservoir, dead_ips
     while True:
@@ -372,29 +386,38 @@ def vpngate_fetch_loop():
                 for n in snapshot:
                     if n["ip"] not in dead_ips:
                         global_node_reservoir[n["ip"]] = n
-            print(f"[*] ⚡ 节点库已从云端低频更新，当前囤积有效节点 -> {len(global_node_reservoir)} 个", flush=True)
-        # 每 5 分钟 (300秒) 才请求一次外部 API，彻底解决宽带耗尽问题
+            print(f"[*] ⚡ 节点库更新，当前囤积有效节点 -> {len(global_node_reservoir)} 个", flush=True)
         time.sleep(300)
 
-def setup_routing():
-    dev, table = "tun0", "100"
-    subprocess.run(["ip", "rule", "del", "table", table], capture_output=True)
-    subprocess.run(["ip", "route", "flush", "table", table], capture_output=True)
-    subprocess.run(["ip", "route", "add", "default", "dev", dev, "table", table], capture_output=True)
-    subprocess.run(["ip", "rule", "add", "oif", dev, "table", table], capture_output=True)
+def setup_routing(tun_name: str, table_id: int):
+    subprocess.run(["ip", "rule", "del", "pref", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "rule", "del", "pref", str(table_id + 1000)], capture_output=True)
+    subprocess.run(["ip", "route", "flush", "table", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "route", "add", "default", "dev", tun_name, "table", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "rule", "add", "oif", tun_name, "lookup", str(table_id), "pref", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "rule", "add", "iif", tun_name, "lookup", str(table_id), "pref", str(table_id + 1000)], capture_output=True)
 
-def connect_node(node: dict):
-    global current_process, current_ip, current_country, connected_at, is_connecting, dead_ips
+def connect_node(tun: Tunnel, node: dict):
+    global dead_ips
     try:
-        dev, cfg_path, log_file = "tun0", CONFIG_DIR / "tun0.ovpn", WORKSPACE / "ovpn_err.log"
+        cfg_path = CONFIG_DIR / f"{tun.name}.ovpn"
+        log_file = WORKSPACE / f"{tun.name}_err.log"
         cfg_path.write_text(node["config"], encoding="utf-8")
+        
         ovpn_version = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
         cipher_args = ["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"] if "2.4" in ovpn_version else ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", "--data-ciphers-fallback", "AES-128-CBC"]
-        cmd = ["openvpn", "--config", str(cfg_path), "--dev", dev, "--dev-type", "tun", "--pull-filter", "ignore", "route-ipv6", "--pull-filter", "ignore", "ifconfig-ipv6", "--route-nopull", "--auth-user-pass", str(AUTH_FILE), "--auth-nocache", "--connect-timeout", "5", "--connect-retry-max", "1", "--verb", "3"] + cipher_args
+        
+        # 强制添加 --nobind 解除端口冲突，--route-nopull 剥夺路由修改权
+        cmd = ["openvpn", "--config", str(cfg_path), "--dev", tun.name, "--dev-type", "tun", 
+               "--nobind", "--route-nopull",
+               "--pull-filter", "ignore", "route-ipv6", "--pull-filter", "ignore", "ifconfig-ipv6", 
+               "--auth-user-pass", str(AUTH_FILE), "--auth-nocache", 
+               "--connect-timeout", "5", "--connect-retry-max", "1", "--verb", "3"] + cipher_args
+               
         with open(log_file, "w") as f: process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         
         success = False
-        for _ in range(12):
+        for _ in range(15):
             time.sleep(1)
             if process.poll() is not None: break
             try:
@@ -403,90 +426,101 @@ def connect_node(node: dict):
             except: pass
                 
         if success and process.poll() is None:
+            setup_routing(tun.name, tun.table_id)
+            time.sleep(1) 
+            
             is_residential = True
             try:
-                print(f"[*] 节点 ({node['country']}) 隧道打通，鉴定是否为纯正住宅IP...", flush=True)
                 req_url = f"https://ip.net.coffee/ip/{node['ip']}"
-                check_req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0"})
+                check_req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
                 with urllib.request.urlopen(check_req, timeout=10) as check_res:
                     api_resp = check_res.read().decode("utf-8").lower()
-                    if "residential" in api_resp or "isp" in api_resp or "住宅" in api_resp:
-                        is_residential = True
-                    else:
-                        clean_resp = api_resp.replace(" ", "").replace("\\n", "").replace("\\r", "")
-                        if "hosting" in api_resp or "datacenter" in api_resp or "机房" in api_resp or "data center" in api_resp:
-                            if '"hosting":false' not in clean_resp and '"datacenter":false' not in clean_resp:
-                                is_residential = False
+                    clean_resp = api_resp.replace(" ", "").replace("\\n", "").replace("\\r", "")
+                    if "hosting" in api_resp or "datacenter" in api_resp or "机房" in api_resp or "data center" in api_resp:
+                        if '"hosting":false' not in clean_resp and '"datacenter":false' not in clean_resp:
+                            is_residential = False
             except Exception as e: pass
             
             if not is_residential:
-                print(f"[-] 节点 ({node['country']}) 检测为机房IP，残忍抛弃: {node['ip']}", flush=True)
-                try: process.terminate(); process.wait(timeout=2)
-                except: process.kill()
+                print(f"[-] {tun.name} 节点检测为机房 IP，残忍抛弃: {node['ip']}", flush=True)
                 dead_ips.add(node["ip"])
-                with state_lock: is_connecting = False
+                try: process.terminate(); process.wait(2)
+                except: process.kill()
                 return
 
-            setup_routing()
-            time.sleep(1) 
-            
-            print(f"[*] 节点 ({node['country']}) 正在进行流媒体解锁测试 (仅测 YouTube)...", flush=True)
-            services = {
-                "YouTube": "https://www.youtube.com"
-            }
-            check_passed = True
-            for name, url in services.items():
-                res = subprocess.run(["curl", "-I", "-s", "-A", "Mozilla/5.0", "-m", "5", "--interface", "tun0", url], capture_output=True)
-                if res.returncode != 0:
-                    print(f"[-] 节点 ({node['country']}) 无法连通 {name} (ErrCode: {res.returncode})，直接拉黑更换: {node['ip']}", flush=True)
-                    check_passed = False
-                    break
-                    
-            if not check_passed:
-                try: process.terminate(); process.wait(timeout=2)
-                except: process.kill()
+            print(f"[*] {tun.name} 进行流媒体质检 (YouTube)...", flush=True)
+            res = subprocess.run(["curl", "-I", "-s", "-A", "Mozilla/5.0", "-m", "5", "--interface", tun.name, "https://www.youtube.com"], capture_output=True)
+            if res.returncode != 0:
+                print(f"[-] {tun.name} 节点无法连通 YouTube，拉黑更换: {node['ip']}", flush=True)
                 dead_ips.add(node["ip"])
-                with state_lock: is_connecting = False
+                try: process.terminate(); process.wait(2)
+                except: process.kill()
                 return
 
             with state_lock:
-                current_process = process
-                current_ip = node["ip"]
-                current_country = node["country"]
-                connected_at = time.time()
-            print(f"[+] 代理节点 ({node['country']}) 完全就绪 (住宅与 YouTube 双重检测通过): {node['ip']}", flush=True)
-            
+                tun.process = process
+                tun.node = node
+                tun.ip = node["ip"]
+                tun.country = node["country"]
+                tun.connected_at = time.time()
+                tun.ready = True
+            role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
+            print(f"[+] {tun.name} ({role}) 完全就绪: {node['ip']}", flush=True)
         else:
-            try: process.terminate(); process.wait(timeout=2)
+            try: process.terminate(); process.wait(2)
             except: process.kill()
             dead_ips.add(node["ip"])
     finally:
-        with state_lock: is_connecting = False
+        with state_lock: tun.is_connecting = False
 
 def health_check_loop():
-    global current_process, current_ip, connected_at, dead_ips
+    global tun_main, dead_ips
     while True:
-        time.sleep(20)
-        need_reconnect = False
+        time.sleep(10)
+        target_tun = ""
         target_ip = ""
-        process_ref = None
+        proc_ref = None
         
         with state_lock:
-            if current_process and current_process.poll() is None and (time.time() - connected_at > 15):
-                need_reconnect = True
-                target_ip = current_ip
-                process_ref = current_process
+            if tun_main.ready and tun_main.process and tun_main.process.poll() is None:
+                if time.time() - tun_main.connected_at > 15:
+                    target_tun = tun_main.name
+                    target_ip = tun_main.ip
+                    proc_ref = tun_main.process
+            if not target_tun: continue
                 
-        if need_reconnect:
-            res = subprocess.run(["curl", "-s", "-m", "5", "--interface", "tun0", "https://api.ipify.org"], capture_output=True)
-            if res.returncode != 0:
-                print(f"[!] 通道假死断流，果断踢线重拨: {target_ip}", flush=True)
-                dead_ips.add(target_ip)
-                try: process_ref.terminate(); process_ref.wait(timeout=2)
-                except: process_ref.kill()
+        res = subprocess.run(["curl", "-s", "-m", "5", "--interface", target_tun, "https://api.ipify.org"], capture_output=True)
+        if res.returncode != 0:
+            print(f"[!] {target_tun} 通道假死断流，果断踢线: {target_ip}", flush=True)
+            dead_ips.add(target_ip)
+            try: proc_ref.terminate(); proc_ref.wait(timeout=2)
+            except: proc_ref.kill()
+            with state_lock:
+                if tun_main.process == proc_ref: tun_main.ready = False
+
+def get_best_candidate():
+    global global_node_reservoir, dead_ips, target_country, tun_main, tun_backup
+    with reservoir_lock:
+        all_pool_nodes = sorted(list(global_node_reservoir.values()), key=lambda x: x["ping"])
+        candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in dead_ips]
+        
+        active_ips = []
+        if tun_main.ip: active_ips.append(tun_main.ip)
+        if tun_backup.ip: active_ips.append(tun_backup.ip)
+        candidates = [n for n in candidates if n["ip"] not in active_ips]
+
+        if not candidates:
+            has_blacklisted = any(n["country"] == target_country for n in all_pool_nodes)
+            if has_blacklisted:
+                dead_ips.clear()
+                print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点枯竭，解锁历史黑名单救场！", flush=True)
+                candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in active_ips]
+
+        if candidates: return candidates.pop(0)
+    return None
 
 def maintain_pool():
-    global dead_ips, last_blacklist_clear, global_node_reservoir, current_process, current_ip, current_country, is_connecting, target_country
+    global dead_ips, last_blacklist_clear, tun_main, tun_backup
     while True:
         if time.time() - last_blacklist_clear > 600:
             dead_ips.clear()
@@ -495,47 +529,55 @@ def maintain_pool():
         with reservoir_lock:
             now = time.time()
             stale_ips = [ip for ip, node in global_node_reservoir.items() if now - node["harvested_at"] > 10800]
-            for ip in stale_ips:
-                global_node_reservoir.pop(ip, None)
+            for ip in stale_ips: global_node_reservoir.pop(ip, None)
 
-        needs_dispatch = False
         with state_lock:
-            if not is_connecting and (current_process is None or current_process.poll() is not None):
-                needs_dispatch = True
-                current_process = None
-                current_ip = ""
-                current_country = ""
-        
-        if needs_dispatch:
-            with reservoir_lock:
-                all_pool_nodes = sorted(list(global_node_reservoir.values()), key=lambda x: x["ping"])
-                
-                candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in dead_ips]
-                
-                if not candidates:
-                    has_blacklisted = any(n["country"] == target_country for n in all_pool_nodes)
-                    if has_blacklisted:
-                        dead_ips.clear()
-                        print(f"[!] ⚡ 紧急熔断触发：[{target_country}] 节点枯竭，已解锁历史黑名单救场！", flush=True)
-                        candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in dead_ips]
-
-                if candidates:
-                    node = candidates.pop(0)
-                    with state_lock: is_connecting = True
-                    threading.Thread(target=connect_node, args=(node,), daemon=True).start()
-                    time.sleep(0.5)
+            main_dead = (tun_main.process is None or tun_main.process.poll() is not None or not tun_main.ready)
+            if main_dead:
+                if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None:
+                    print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: {tun_backup.ip}", flush=True)
+                    # 状态互换 (身份对调)
+                    tun_main, tun_backup = tun_backup, tun_main
+                    proxy_server.ACTIVE_BIND = tun_main.name
+                    
+                    # 异步清理死掉的旧主卡 (现在的 tun_backup)
+                    if tun_backup.process:
+                        try: tun_backup.process.terminate(); tun_backup.process.wait(2)
+                        except: tun_backup.process.kill()
+                    tun_backup.process = None; tun_backup.node = None; tun_backup.ip = ""
+                    tun_backup.ready = False; tun_backup.is_connecting = False
                 else:
-                    pass # 静默等待，避免刷屏
-        
-        # 维持 5 秒的超高频本地健康检查
-        time.sleep(5)
+                    if tun_main.process:
+                        try: tun_main.process.terminate(); tun_main.process.wait(2)
+                        except: tun_main.process.kill()
+                    tun_main.process = None; tun_main.ready = False; tun_main.is_connecting = False
+
+        with state_lock:
+            needs_main = not tun_main.ready and not tun_main.is_connecting
+            needs_backup = not tun_backup.ready and not tun_backup.is_connecting
+
+        if needs_main:
+            node = get_best_candidate()
+            if node:
+                with state_lock: tun_main.is_connecting = True
+                threading.Thread(target=connect_node, args=(tun_main, node,), daemon=True).start()
+                time.sleep(1)
+        elif needs_backup:
+            node = get_best_candidate()
+            if node:
+                with state_lock: tun_backup.is_connecting = True
+                threading.Thread(target=connect_node, args=(tun_backup, node,), daemon=True).start()
+
+        time.sleep(2)
 
 def main():
-    global PROXY_PORT
+    global PROXY_PORT, tun_main
     if os.geteuid() != 0: return
     get_public_ip()
     setup_env()
-    subprocess.run(["pkill", "-f", "openvpn.*tun[0-9]"], capture_output=True)
+    subprocess.run(["pkill", "-f", "openvpn.*tun_main|tun_backup"], capture_output=True)
+    
+    proxy_server.ACTIVE_BIND = tun_main.name
     
     try:
         req = urllib.request.Request(f"{C2_URL}/api/config", headers=get_c2_headers())
@@ -545,15 +587,12 @@ def main():
     except: pass
 
     print("========================================", flush=True)
-    print(f"  Proxy Controller 引擎启动！(工作端口: {PROXY_PORT})", flush=True)
+    print(f"  Proxy Controller (主备双活引擎) 启动！端口: {PROXY_PORT}", flush=True)
     print("========================================", flush=True)
 
     threading.Thread(target=vpngate_fetch_loop, daemon=True).start()
     threading.Thread(target=update_config_loop, daemon=True).start()
-
-    import proxy_server
-    threading.Thread(target=proxy_server.start_proxy_server, args=("0.0.0.0", PROXY_PORT, "tun0"), daemon=True).start()
-    
+    threading.Thread(target=proxy_server.start_proxy_server, args=("0.0.0.0", PROXY_PORT), daemon=True).start()
     threading.Thread(target=health_check_loop, daemon=True).start()
     threading.Thread(target=c2_heartbeat_loop, daemon=True).start()
     maintain_pool()
@@ -567,26 +606,28 @@ if __name__ == "__main__":
     if (url.pathname === "/agent") {
       const agentScript = `#!/usr/bin/env bash
 echo "=========================================================="
-echo "     Proxy Controller    "
+echo "     Proxy Controller (Active-Standby Multi-Tunnel)    "
 echo "=========================================================="
 
-crontab -l 2>/dev/null | grep -v "/opt/proxy_lite/heartbeat.sh" | crontab -
-rm -f /opt/proxy_lite/heartbeat.sh
+# 彻底修复内核反向路径过滤导致备用通道回包被丢弃的问题
+echo "net.ipv4.conf.all.rp_filter=2" > /etc/sysctl.d/99-proxy-lite.conf
+echo "net.ipv4.conf.default.rp_filter=2" >> /etc/sysctl.d/99-proxy-lite.conf
+sysctl --system >/dev/null 2>&1
 
 apt-get update -q
-apt-get install -y openvpn python3 curl iproute2 iptables cron
+apt-get install -y openvpn python3 curl iproute2 iptables cron psmisc
 
 mkdir -p /opt/proxy_lite/configs
 cd /opt/proxy_lite
 
-echo "[1/3] 从安全中心拉取极速引擎..."
+echo "[1/3] 从安全中心拉取双活极速引擎..."
 curl -sLo lite_manager.py ${domain}/scripts/lite_manager.py
 curl -sLo proxy_server.py ${domain}/scripts/proxy_server.py
 
 echo "[2/3] 配置系统守护服务..."
 cat > /lib/systemd/system/proxy-lite.service << 'EOF'
 [Unit]
-Description=  Proxy Core Engine
+Description=Proxy Core Engine (Active-Standby)
 After=network.target
 
 [Service]
@@ -606,7 +647,7 @@ systemctl daemon-reload
 systemctl enable proxy-lite.service
 systemctl restart proxy-lite.service
 
-echo "[+] 引擎更新成功！全息日志和无流量损耗调度机制已加载。"
+echo "[+] 引擎更新成功！主备双活通道、异步刷IP逻辑已全量加载。"
 `;
       return new Response(agentScript, { headers: { "Content-Type": "text/plain;charset=UTF-8" } });
     }
@@ -618,7 +659,7 @@ echo "[+] 引擎更新成功！全息日志和无流量损耗调度机制已加�
             const reqUrl = `https://ip.net.coffee/api/ip/lookup/${targetIp}`;
             const resp = await fetch(reqUrl, {
                 headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                     "Accept": "application/json",
                     "Referer": "https://ip.net.coffee/"
                 }
@@ -729,7 +770,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Proxy Controller - 核心总控</title>
+    <title>Proxy Controller - 双活引擎总控</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
@@ -803,8 +844,8 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 </div>
                 
                 <div class="mb-6 relative z-10">
-                    <h2 class="text-2xl font-bold text-slate-100 tracking-wide mb-1">全局调度引擎</h2>
-                    <p class="text-sm text-slate-400">单路端口锁定，节点假死将在极短时间内由云端蓄水池自动顶替新节点，业务零感知。</p>
+                    <h2 class="text-2xl font-bold text-slate-100 tracking-wide mb-1 flex items-center gap-2">主备双活调度引擎 <span class="bg-indigo-500/20 text-indigo-400 text-[10px] uppercase font-bold px-2 py-0.5 rounded-full border border-indigo-500/30">Active-Standby</span></h2>
+                    <p class="text-sm text-slate-400">单路端口锁定，内置主备双路隧道 (tun_main / tun_backup)，通道死活将由软开关瞬间接管。</p>
                 </div>
                 
                 <div class="flex flex-wrap items-center bg-slate-950/50 border border-slate-800/80 rounded-xl p-5 relative z-10 gap-y-4">
@@ -851,7 +892,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                     <thead>
                         <tr class="bg-slate-900/80 text-slate-400 text-xs uppercase tracking-wider">
                             <th class="py-4 px-6 font-medium w-1/5">母机宿主 IP</th>
-                            <th class="py-4 px-6 font-medium">代理通道状态 (国家 | 出口IP:动态端口 | 质检)</th>
+                            <th class="py-4 px-6 font-medium">当前主出口通道状态 (Active)</th>
                             <th class="py-4 px-6 font-medium w-32">心跳延迟</th>
                             <th class="py-4 px-6 font-medium text-right w-24">负载率</th>
                         </tr>
@@ -938,7 +979,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 method: 'POST',
                 body: JSON.stringify({ "0": val, "port": port, "switch_trigger": Date.now() })
             });
-            alert('🔄 重拨指令已下发！VPS 将在8秒内心跳同步并拉黑旧 IP，请稍候...');
+            alert('🔄 重拨指令已下发！VPS 将清退当前通道池重新并发建连...');
         }
 
         async function loadNativeIpScore(ip) {
@@ -1041,7 +1082,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                             <span class="bg-indigo-500/20 text-indigo-400 font-bold font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-indigo-500/20">\${d.country}</span>
                             <span class="font-mono text-slate-300 text-sm tracking-wide mr-3" title="出口物理 IP">\${d.node_ip || '---.---.---.---'}:\${d.port}</span>
                             <span class="flex items-center gap-1.5 text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/20 text-xs font-medium" title="已通过住宅 IP 与 YouTube 连通性双重检测">
-                                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span> 纯净解锁 (YT)
+                                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span> 纯净双活
                             </span>
                         </div>\`
                     ).join('');
@@ -1049,7 +1090,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                     if (details.length === 0) proxyBadges = \`
                         <div class="inline-flex items-center bg-slate-900 border border-amber-500/30 rounded-xl px-3 py-1.5 shadow-inner text-amber-400/90 text-sm">
                             <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-amber-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                            正在抓取匹配资源...
+                            节点震荡熔断，异步抢救中...
                         </div>
                     \`;
 
