@@ -496,28 +496,52 @@ def connect_node(tun: Tunnel, node: dict):
 
 def health_check_loop():
     global tun_main, dead_ips
+    fail_count = 0
     while True:
-        time.sleep(10)
+        time.sleep(15)
         target_tun = ""
         target_entry_ip = ""
         proc_ref = None
         
         with state_lock:
             if tun_main.ready and tun_main.process and tun_main.process.poll() is None:
-                if time.time() - tun_main.connected_at > 15:
+                if time.time() - tun_main.connected_at > 20:
                     target_tun = tun_main.name
                     target_entry_ip = tun_main.entry_ip
                     proc_ref = tun_main.process
-            if not target_tun: continue
+        
+        if not target_tun:
+            fail_count = 0
+            continue
+            
+        # 使用多个高可用节点交叉验证，防止单点 API 限流导致的误判
+        endpoints = [
+            "http://www.gstatic.com/generate_204",
+            "http://cp.cloudflare.com/generate_204",
+            "https://api.ipify.org"
+        ]
+        
+        is_alive = False
+        for ep in endpoints:
+            res = subprocess.run(["curl", "-I", "-s", "-m", "5", "--interface", target_tun, ep], capture_output=True)
+            if res.returncode == 0:
+                is_alive = True
+                break
                 
-        res = subprocess.run(["curl", "-s", "-m", "5", "--interface", target_tun, "https://api.ipify.org"], capture_output=True)
-        if res.returncode != 0:
-            print(f"[!] {target_tun} 通道假死断流，果断踢线: {target_entry_ip}", flush=True)
-            dead_ips.add(target_entry_ip)
-            try: proc_ref.terminate(); proc_ref.wait(timeout=2)
-            except: proc_ref.kill()
-            with state_lock:
-                if tun_main.process == proc_ref: tun_main.ready = False
+        if not is_alive:
+            fail_count += 1
+            if fail_count >= 2:
+                print(f"[!] {target_tun} 连续多次跨节点验证失败，确认假死断流，踢线: {target_entry_ip}", flush=True)
+                dead_ips.add(target_entry_ip)
+                try: proc_ref.terminate(); proc_ref.wait(timeout=2)
+                except: proc_ref.kill()
+                with state_lock:
+                    if tun_main.process == proc_ref: tun_main.ready = False
+                fail_count = 0
+            else:
+                print(f"[*] {target_tun} 健康检测无响应，进入二次验证阶段 ({fail_count}/2)...", flush=True)
+        else:
+            fail_count = 0
 
 def get_best_candidate():
     global global_node_reservoir, dead_ips, target_country, tun_main, tun_backup
