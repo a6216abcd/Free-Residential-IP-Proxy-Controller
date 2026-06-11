@@ -36,13 +36,22 @@ jobs:
           [vars]
           WEB_USER = "${{ vars.WEB_USER }}"
           WEB_PASS = "${{ vars.WEB_PASS }}"
+          EOF
+          
+          # 仅在定义了 PROXY_USER 和 PROXY_PASS 时才添加
+          if [ -n "${{ vars.PROXY_USER }}" ] && [ -n "${{ vars.PROXY_PASS }}" ]; then
+            cat >> wrangler.toml << 'EOF'
           PROXY_USER = "${{ vars.PROXY_USER }}"
           PROXY_PASS = "${{ vars.PROXY_PASS }}"
+          EOF
+          fi
+          
+          # D1 数据库配置（数据库 ID 由 wrangler cli 自动获取）
+          cat >> wrangler.toml << 'EOF'
           
           [[d1_databases]]
           binding = "DB"
           database_name = "proxy_db"
-          database_id = "${{ vars.D1_DATABASE_ID }}"
           EOF
 
       - name: Deploy to Cloudflare Workers
@@ -53,4 +62,3 @@ jobs:
 
       - name: Deployment successful
         run: echo "✅ Worker deployed successfully to Cloudflare"
-        
