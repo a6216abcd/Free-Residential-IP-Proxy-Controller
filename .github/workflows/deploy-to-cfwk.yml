@@ -1,4 +1,4 @@
-name: Deploy to Cloudflare Workers
+Name: Deploy to Cloudflare Workers
 
 on:
   push:
@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # 保持你原有的全局变量定义
     env:
       CF_API_TOKEN: ${{ vars.CF_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
@@ -28,29 +29,33 @@ jobs:
       - name: Install dependencies
         run: |
           npm ci
-          npm install -g wrangler
+          npm install wrangler --save-dev
 
       - name: Check or Create D1 Database
         id: d1_id
         env:
-          CLOUDFLARE_API_TOKEN: ${CF_API_TOKEN}
-          CLOUDFLARE_ACCOUNT_ID: ${CF_ACCOUNT_ID}
+          CLOUDFLARE_API_TOKEN: ${{ env.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
         run: |
           echo "开始查找数据库 'proxy_db' 并获取ID"
-          D1_ID=$(wrangler d1 list --json | jq -r '.[] | select(.name=="proxy_db") | .uuid' 2>/dev/null || echo "")
+          D1_ID=$(npx wrangler d1 list --json 2>/dev/null | jq -r '.[] | select(.name=="proxy_db") | .uuid' 2>/dev/null || echo "")
           
           if [ -z "$D1_ID" ]; then
             echo "数据库 'proxy_db' 不存在, 正在创建..."
-            CREATE_OUTPUT=$(wrangler d1 create proxy_db --json)
-            D1_ID=$(echo "$CREATE_OUTPUT" | jq -r '.uuid')
+            CREATE_OUTPUT=$(npx wrangler d1 create proxy_db)
+            D1_ID=$(echo "$CREATE_OUTPUT" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -n 1)
             echo "✅ 数据库 'proxy_db' 创建成功，ID: $D1_ID"
           else
             echo "✅ 找到数据库 'proxy_db'，ID: $D1_ID"
           fi
           
+          if [ -z "$D1_ID" ]; then
+            echo "❌ 错误: 未能获取到 D1 数据库 ID！"
+            exit 1
+          fi
+          
           echo "D1_ID=$D1_ID" >> $GITHUB_OUTPUT
 
-      # 2. 生成 wrangler.toml 配置
       - name: Create wrangler config with secrets
         run: |
           cat > wrangler.toml << 'EOF'
@@ -82,9 +87,10 @@ jobs:
           EOF
 
       - name: Deploy to Cloudflare Workers
+        # 🟢 修正：使用正确的 ${{ env.xxx }} 语法进行变量传递
         env:
-          CLOUDFLARE_API_TOKEN: ${CF_API_TOKEN}
-          CLOUDFLARE_ACCOUNT_ID: ${CF_ACCOUNT_ID}
+          CLOUDFLARE_API_TOKEN: ${{ env.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
         run: |
           npm run deploy
           echo "✅ Worker deployed successfully to Cloudflare"
