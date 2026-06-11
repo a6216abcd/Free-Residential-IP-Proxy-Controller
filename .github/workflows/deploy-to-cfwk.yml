@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # 保持你原有的全局变量定义
     env:
       CF_API_TOKEN: ${{ vars.CF_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
