@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  CLOUDFLARE_API_TOKEN: ${{ vars.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -24,6 +28,35 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Check or Create D1 Database
+        id: d1_id
+        run: |
+          # 检查数据库是否存在
+          LIST_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json")
+          
+          D1_ID=$(echo "$LIST_RESPONSE" | jq -r '.result[] | select(.name=="proxy_db") | .uuid' 2>/dev/null || echo "")
+          
+          if [ -z "$D1_ID" ]; then
+            echo "Database 'proxy_db' not found, creating..."
+            # 创建新数据库
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"name":"proxy_db"}')
+            
+            D1_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.uuid')
+            echo "✅ Database created with ID: $D1_ID"
+          else
+            echo "✅ Database 'proxy_db' found with ID: $D1_ID"
+          fi
+          
+          echo "D1_ID=$D1_ID" >> $GITHUB_OUTPUT
 
       - name: Create wrangler config with secrets
         run: |
@@ -46,20 +79,17 @@ jobs:
           EOF
           fi
           
-          # D1 数据库配置（数据库 ID 由 wrangler cli 自动获取）
+          # D1 数据库配置（使用动态获取的数据库 ID）
           cat >> wrangler.toml << 'EOF'
           
           [[d1_databases]]
           binding = "DB"
           database_name = "proxy_db"
+          database_id = "${{ steps.d1_id.outputs.D1_ID }}"
           EOF
 
       - name: Deploy to Cloudflare Workers
         run: npm run deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ vars.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Deployment successful
         run: echo "✅ Worker deployed successfully to Cloudflare"
-        
