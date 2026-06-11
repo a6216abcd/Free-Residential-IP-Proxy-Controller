@@ -52,10 +52,46 @@ jobs:
           
           echo "D1_ID=$D1_ID" >> $GITHUB_OUTPUT
 
-      - name: Deploy to Cloudflare Workers
+      - name: Generate Config and Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
         run: |
-          wrangler deploy src/index.js
+          echo "正在动态生成 wrangler.toml 配置文件..."
+          
+          # 写入基础配置及必选环境变量
+          cat > wrangler.toml << 'EOF'
+          name = "proxy-zhuzhai-ip"
+          main = "src/index.js"
+          compatibility_date = "2026-06-03"
+          workers_dev = true
+          
+          [vars]
+          WEB_USER = "${{ vars.WEB_USER }}"
+          WEB_PASS = "${{ vars.WEB_PASS }}"
+          EOF
+          
+          # 条件拼接：仅在定义了 PROXY_USER 和 PROXY_PASS 时才追加
+          if [ -n "${{ vars.PROXY_USER }}" ] && [ -n "${{ vars.PROXY_PASS }}" ]; then
+            cat >> wrangler.toml << 'EOF'
+          PROXY_USER = "${{ vars.PROXY_USER }}"
+          PROXY_PASS = "${{ vars.PROXY_PASS }}"
+          EOF
+          fi
+          
+          # 追加 D1 数据库绑定（使用上一步获取到的动态 D1_ID）
+          cat >> wrangler.toml << 'EOF'
+          
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "proxy_db"
+          database_id = "${{ steps.d1_id.outputs.D1_ID }}"
+          EOF
+          
+          echo "📑 wrangler.toml 拼接完成！内容如下："
+          cat wrangler.toml
+          echo "----------------------------------------"
+          
+          # 执行部署
+          wrangler deploy
           echo "✅ Worker deployed successfully to Cloudflare"
