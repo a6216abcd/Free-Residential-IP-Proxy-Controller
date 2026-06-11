@@ -1,0 +1,56 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create wrangler config with secrets
+        run: |
+          cat > wrangler.toml << 'EOF'
+          name = "proxy-zhuzhai-ip"
+          main = "src/index.js"
+          compatibility_date = "2026-06-03"
+          workers_dev = true
+          
+          [vars]
+          WEB_USER = "${{ vars.WEB_USER }}"
+          WEB_PASS = "${{ vars.WEB_PASS }}"
+          PROXY_USER = "${{ vars.PROXY_USER }}"
+          PROXY_PASS = "${{ vars.PROXY_PASS }}"
+          
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "proxy_db"
+          database_id = "${{ vars.D1_DATABASE_ID }}"
+          EOF
+
+      - name: Deploy to Cloudflare Workers
+        run: npm run deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ vars.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deployment successful
+        run: echo "✅ Worker deployed successfully to Cloudflare"
+        
