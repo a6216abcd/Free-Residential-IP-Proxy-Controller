@@ -1,4 +1,4 @@
-Name: Deploy to Cloudflare Workers
+name: Deploy to Cloudflare Workers
 
 on:
   push:
@@ -23,12 +23,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
-      - name: Install dependencies
-        run: |
-          npm ci
-          npm install wrangler --save-dev
+      - name: Install Wrangler
+        run: npm install -g wrangler
 
       - name: Check or Create D1 Database
         id: d1_id
@@ -37,11 +34,11 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
         run: |
           echo "开始查找数据库 'proxy_db' 并获取ID"
-          D1_ID=$(npx wrangler d1 list --json 2>/dev/null | jq -r '.[] | select(.name=="proxy_db") | .uuid' 2>/dev/null || echo "")
+          D1_ID=$(wrangler d1 list --json 2>/dev/null | jq -r '.[] | select(.name=="proxy_db") | .uuid' 2>/dev/null || echo "")
           
           if [ -z "$D1_ID" ]; then
             echo "数据库 'proxy_db' 不存在, 正在创建..."
-            CREATE_OUTPUT=$(npx wrangler d1 create proxy_db)
+            CREATE_OUTPUT=$(wrangler d1 create proxy_db)
             D1_ID=$(echo "$CREATE_OUTPUT" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -n 1)
             echo "✅ 数据库 'proxy_db' 创建成功，ID: $D1_ID"
           else
@@ -55,41 +52,10 @@ jobs:
           
           echo "D1_ID=$D1_ID" >> $GITHUB_OUTPUT
 
-      - name: Create wrangler config with secrets
-        run: |
-          cat > wrangler.toml << 'EOF'
-          name = "proxy-zhuzhai-ip"
-          main = "src/index.js"
-          compatibility_date = "2026-06-03"
-          workers_dev = true
-          
-          [vars]
-          WEB_USER = "${{ vars.WEB_USER }}"
-          WEB_PASS = "${{ vars.WEB_PASS }}"
-          EOF
-          
-          # 仅在定义了 PROXY_USER 和 PROXY_PASS 时才添加
-          if [ -n "${{ vars.PROXY_USER }}" ] && [ -n "${{ vars.PROXY_PASS }}" ]; then
-            cat >> wrangler.toml << 'EOF'
-          PROXY_USER = "${{ vars.PROXY_USER }}"
-          PROXY_PASS = "${{ vars.PROXY_PASS }}"
-          EOF
-          fi
-          
-          # 追加 D1 数据库绑定
-          cat >> wrangler.toml << 'EOF'
-          
-          [[d1_databases]]
-          binding = "DB"
-          database_name = "proxy_db"
-          database_id = "${{ steps.d1_id.outputs.D1_ID }}"
-          EOF
-
       - name: Deploy to Cloudflare Workers
-        # 🟢 修正：使用正确的 ${{ env.xxx }} 语法进行变量传递
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
         run: |
-          npm run deploy
+          wrangler deploy src/index.js
           echo "✅ Worker deployed successfully to Cloudflare"
