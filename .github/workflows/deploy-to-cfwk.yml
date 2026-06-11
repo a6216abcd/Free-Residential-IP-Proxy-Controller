@@ -6,15 +6,14 @@ on:
       - main
   workflow_dispatch:
 
-env:
-  CLOUDFLARE_API_TOKEN: ${{ vars.CLOUDFLARE_API_TOKEN }}
-  CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      CF_API_TOKEN: ${{ vars.CF_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
 
     steps:
       - name: Checkout code
@@ -27,37 +26,31 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
-
-      - name: Install Wrangler
-        run: npm install -g wrangler
+        run: |
+          npm ci
+          npm install -g wrangler
 
       - name: Check or Create D1 Database
         id: d1_id
+        env:
+          CLOUDFLARE_API_TOKEN: ${CF_API_TOKEN}
+          CLOUDFLARE_ACCOUNT_ID: ${CF_ACCOUNT_ID}
         run: |
-          # 检查数据库是否存在
-          LIST_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json")
-          
-          D1_ID=$(echo "$LIST_RESPONSE" | jq -r '.result[] | select(.name=="proxy_db") | .uuid' 2>/dev/null || echo "")
+          echo "开始查找数据库 'proxy_db' 并获取ID"
+          D1_ID=$(wrangler d1 list --json | jq -r '.[] | select(.name=="proxy_db") | .uuid' 2>/dev/null || echo "")
           
           if [ -z "$D1_ID" ]; then
-            echo "Database 'proxy_db' not found, creating..."
-            # 创建新数据库
-            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
-              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d '{"name":"proxy_db"}')
-            
-            D1_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.uuid')
-            echo "✅ Database created with ID: $D1_ID"
+            echo "数据库 'proxy_db' 不存在, 正在创建..."
+            CREATE_OUTPUT=$(wrangler d1 create proxy_db --json)
+            D1_ID=$(echo "$CREATE_OUTPUT" | jq -r '.uuid')
+            echo "✅ 数据库 'proxy_db' 创建成功，ID: $D1_ID"
           else
-            echo "✅ Database 'proxy_db' found with ID: $D1_ID"
+            echo "✅ 找到数据库 'proxy_db'，ID: $D1_ID"
           fi
           
           echo "D1_ID=$D1_ID" >> $GITHUB_OUTPUT
 
+      # 2. 生成 wrangler.toml 配置
       - name: Create wrangler config with secrets
         run: |
           cat > wrangler.toml << 'EOF'
@@ -79,7 +72,7 @@ jobs:
           EOF
           fi
           
-          # D1 数据库配置（使用动态获取的数据库 ID）
+          # 追加 D1 数据库绑定
           cat >> wrangler.toml << 'EOF'
           
           [[d1_databases]]
@@ -89,7 +82,9 @@ jobs:
           EOF
 
       - name: Deploy to Cloudflare Workers
-        run: npm run deploy
-
-      - name: Deployment successful
-        run: echo "✅ Worker deployed successfully to Cloudflare"
+        env:
+          CLOUDFLARE_API_TOKEN: ${CF_API_TOKEN}
+          CLOUDFLARE_ACCOUNT_ID: ${CF_ACCOUNT_ID}
+        run: |
+          npm run deploy
+          echo "✅ Worker deployed successfully to Cloudflare"
