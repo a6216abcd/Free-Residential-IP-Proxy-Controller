@@ -62,3 +62,4 @@ jobs:
 
       - name: Deployment successful
         run: echo "✅ Worker deployed successfully to Cloudflare"
+        
