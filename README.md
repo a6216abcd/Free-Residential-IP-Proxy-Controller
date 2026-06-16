@@ -4,9 +4,11 @@
 
 本项目资源完全免费，均免费来自于互联网整合而成，如果有人问你收费，你肯定是上当受骗了！！！
 
-# 一键极速部署
+# 一键极速部署  
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a6216abcd/Free-Residential-IP-Proxy-Controller)
+
+一键极速部署如果报400的错误,就是CF账户风控了，重新注册一个CF新号即可部署成功
 
 KUI面板正在集成融合免费免费住宅IP代理调度系统 https://github.com/a6216abcd/K-UI
 
