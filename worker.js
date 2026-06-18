@@ -209,8 +209,16 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
 
 def start_proxy_server(host: str, port: int) -> None:
     try:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # 支持双栈：判断地址中是否包含冒号以启用 AF_INET6
+        af = socket.AF_INET6 if ":" in host else socket.AF_INET
+        server = socket.socket(af, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # 强制解除 V6ONLY，允许一个 IPv6 Socket 同时接收 IPv4 和 IPv6 连接
+        if af == socket.AF_INET6:
+            try:
+                server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except:
+                pass
         server.bind((host, port))
         server.listen(256)
     except Exception as e: return
@@ -662,7 +670,8 @@ def main():
 
     threading.Thread(target=vpngate_fetch_loop, daemon=True).start()
     threading.Thread(target=update_config_loop, daemon=True).start()
-    threading.Thread(target=proxy_server.start_proxy_server, args=("0.0.0.0", PROXY_PORT), daemon=True).start()
+    # 启用全局 IPv6 ANY 监听
+    threading.Thread(target=proxy_server.start_proxy_server, args=("::", PROXY_PORT), daemon=True).start()
     threading.Thread(target=health_check_loop, daemon=True).start()
     threading.Thread(target=c2_heartbeat_loop, daemon=True).start()
     maintain_pool()
@@ -1136,7 +1145,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 const terminal = document.getElementById('terminal-output');
                 
                 if (!servers || servers.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
                     return;
                 }
 
